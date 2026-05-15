@@ -15,7 +15,7 @@ from utils.gemini_handler import generate_answer
 # Load environment variables (.env)
 load_dotenv()
 
-api_key = os.getenv("AIzaSyDwjt08DB6PkGdJV5_IZOjmVphrBTFy6rY")
+api_key = os.getenv("AIzaSyAFhXSaWdIDDpnG7-veDN19SWWUAlyERzY")
 
 # Set up Streamlit page configuration
 st.set_page_config(
@@ -26,8 +26,6 @@ st.set_page_config(
 )
 
 
-genai.configure(api_key=AIzaSyDwjt08DB6PkGdJV5_IZOjmVphrBTFy6rY)
-st.write(api_key)
 # Custom CSS for modern styling
 st.markdown("""
 <style>
