@@ -1,206 +1,249 @@
-import streamlit as st
 import os
-import tempfile
-from pathlib import Path
+import streamlit as st
+from dotenv import load_dotenv
+import time
+from fpdf import FPDF
+import google.generativeai as genai
 
-from rag_engine import RAGEngine
+# Import our utility functions
+from utils.pdf_loader import save_uploaded_file, load_pdf_documents
+from utils.chunking import split_documents
+from utils.embeddings import create_vector_db, load_vector_db
+from utils.retriever import retrieve_relevant_chunks
+from utils.gemini_handler import generate_answer
 
-# ── Page config ──────────────────────────────────────────────────────────────
+# Load environment variables (.env)
+load_dotenv()
+
+api_key = os.getenv("AIzaSyDwjt08DB6PkGdJV5_IZOjmVphrBTFy6rY")
+
+# Set up Streamlit page configuration
 st.set_page_config(
     page_title="Study Buddy RAG",
     page_icon="📚",
     layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
+
+genai.configure(api_key=AIzaSyDwjt08DB6PkGdJV5_IZOjmVphrBTFy6rY)
+st.write(api_key)
+# Custom CSS for modern styling
 st.markdown("""
 <style>
+    .stApp {
+        font-family: 'Inter', sans-serif;
+    }
     .main-header {
         font-size: 2.5rem;
         font-weight: 700;
-        color: #1a73e8;
+        color: #1E88E5;
         text-align: center;
-        margin-bottom: 0.2rem;
+        margin-bottom: 0;
     }
     .sub-header {
         text-align: center;
-        color: #5f6368;
+        color: #555;
+        font-size: 1.1rem;
         margin-bottom: 2rem;
     }
-    .chunk-box {
-        background: #f8f9fa;
-        border-left: 4px solid #1a73e8;
-        padding: 0.8rem 1rem;
+    .source-chunk {
+        background-color: #f8f9fa;
+        border-left: 4px solid #1E88E5;
+        padding: 10px;
+        margin-bottom: 10px;
         border-radius: 4px;
-        margin-bottom: 0.6rem;
-        font-size: 0.85rem;
-        color: #3c4043;
+        font-size: 0.9rem;
     }
-    .answer-box {
-        background: #e8f0fe;
-        border-radius: 8px;
-        padding: 1.2rem;
-        font-size: 1rem;
-        color: #1a1a2e;
-        line-height: 1.7;
+    [data-theme="dark"] .source-chunk {
+        background-color: #1e1e1e;
+        border-left: 4px solid #90caf9;
     }
-    .out-of-scope {
-        background: #fce8e6;
-        border-left: 4px solid #d93025;
-        border-radius: 4px;
-        padding: 1rem;
-        color: #c5221f;
-    }
-    .status-ok  { color: #1e8e3e; font-weight: 600; }
-    .status-err { color: #d93025; font-weight: 600; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Session state ─────────────────────────────────────────────────────────────
-if "rag" not in st.session_state:
-    st.session_state.rag = None
-if "doc_ready" not in st.session_state:
-    st.session_state.doc_ready = False
-if "history" not in st.session_state:
-    st.session_state.history = []
+# Initialize Session State
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "vector_db" not in st.session_state:
+    st.session_state.vector_db = None
+if "is_processed" not in st.session_state:
+    st.session_state.is_processed = False
 
-# ── Header ────────────────────────────────────────────────────────────────────
-st.markdown('<div class="main-header">📚 Study Buddy RAG</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Upload your textbook or notes — ask anything from it!</div>', unsafe_allow_html=True)
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+# ── PDF export (only called on demand) ────────────────────────────────────────
+def create_chat_pdf() -> str:
+    """Generate a PDF of the current chat history and return its file path."""
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 14)
+    pdf.cell(0, 10, "Study Buddy RAG - Chat History", ln=True, align="C")
+    pdf.ln(6)
+
+    for msg in st.session_state.messages:
+        role = "You" if msg["role"] == "user" else "Study Buddy"
+        # Safely encode to latin-1; replace unknown chars with '?'
+        text = msg["content"].encode("latin-1", errors="replace").decode("latin-1")
+
+        pdf.set_font("Arial", "B", 11)
+        pdf.cell(0, 8, f"{role}:", ln=True)
+        pdf.set_font("Arial", "", 10)
+        pdf.multi_cell(0, 7, text)
+        pdf.ln(4)
+
+    pdf_path = "chat_history.pdf"
+    pdf.output(pdf_path)
+    return pdf_path
+
+
+# ── SIDEBAR ────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("⚙️ Configuration")
+    st.image("https://cdn-icons-png.flaticon.com/512/3145/3145765.png", width=100)
+    st.title("📚 Document Settings")
+    st.write("Upload your textbooks or notes to start studying!")
 
-    gemini_key = st.text_input(
-        "Google Gemini API Key",
-        type="password",
-        placeholder="AIza...",
-        help="Get your key at https://aistudio.google.com/app/apikey",
+    uploaded_files = st.file_uploader(
+        "Upload PDF files",
+        type="pdf",
+        accept_multiple_files=True,
     )
 
-    st.divider()
-    st.subheader("📄 Document Upload")
-    uploaded_file = st.file_uploader(
-        "Upload PDF (textbook / notes)",
-        type=["pdf"],
-        help="Handwritten notes converted to PDF also work.",
-    )
+    process_btn = st.button("Process Documents 🚀", type="primary", use_container_width=True)
+
+    if process_btn:
+        if not os.environ.get("GOOGLE_API_KEY"):
+            st.error("⚠️ Please set your GOOGLE_API_KEY in the .env file.")
+        elif not uploaded_files:
+            st.warning("Please upload at least one PDF file.")
+        else:
+            with st.spinner("Extracting text and building knowledge base..."):
+                try:
+                    # Save uploads to disk
+                    file_paths = [save_uploaded_file(f) for f in uploaded_files]
+
+                    # 1. Load PDFs
+                    docs = load_pdf_documents(file_paths)
+                    st.info(f"Loaded {len(docs)} pages.")
+
+                    # 2. Chunk
+                    chunks = split_documents(docs)
+                    st.info(f"Created {len(chunks)} text chunks.")
+
+                    # 3. Build vector DB
+                    vector_db = create_vector_db(chunks)
+                    st.session_state.vector_db = vector_db
+                    st.session_state.is_processed = True
+                    st.success("✅ Knowledge base built! Ask your questions below.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error building knowledge base: {e}")
 
     st.divider()
-    st.subheader("🔧 Chunking Settings")
-    chunk_size    = st.slider("Chunk size (chars)", 300, 1500, 800, 50)
-    chunk_overlap = st.slider("Chunk overlap (chars)", 0, 300, 100, 25)
 
-    st.divider()
-    top_k = st.slider("Top-K chunks to retrieve", 1, 10, 4)
+    # Control buttons
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Clear Chat 🗑️", use_container_width=True):
+            st.session_state.messages = []
+            st.rerun()
 
-    st.divider()
-    if st.button("🗑️ Clear History"):
-        st.session_state.history = []
-        st.rerun()
-
-    # ── Process button ────────────────────────────────────────────────────────
-    process_btn = st.button("🚀 Process Document", use_container_width=True, type="primary")
-
-# ── Document Processing ───────────────────────────────────────────────────────
-if process_btn:
-    if not gemini_key:
-        st.sidebar.error("Please enter your Gemini API key.")
-    elif not uploaded_file:
-        st.sidebar.error("Please upload a PDF first.")
-    else:
-        with st.spinner("Processing document — building vector store…"):
+    with col2:
+        # Only generate & offer PDF when there are messages
+        if st.session_state.messages:
             try:
-                # Save upload to a temp file
-                suffix = Path(uploaded_file.name).suffix
-                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                    tmp.write(uploaded_file.read())
-                    tmp_path = tmp.name
-
-                engine = RAGEngine(
-                    gemini_api_key=gemini_key,
-                    chunk_size=chunk_size,
-                    chunk_overlap=chunk_overlap,
-                )
-                n_chunks = engine.ingest(tmp_path)
-                os.unlink(tmp_path)
-
-                st.session_state.rag       = engine
-                st.session_state.doc_ready = True
-                st.session_state.history   = []
-
-                st.sidebar.markdown(
-                    f'<span class="status-ok">✅ Ready — {n_chunks} chunks indexed</span>',
-                    unsafe_allow_html=True,
-                )
+                pdf_path = create_chat_pdf()
+                with open(pdf_path, "rb") as fh:
+                    st.download_button(
+                        label="Export PDF 📥",
+                        data=fh,
+                        file_name="StudyBuddy_Chat.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
             except Exception as e:
-                st.sidebar.markdown(
-                    f'<span class="status-err">❌ Error: {e}</span>',
-                    unsafe_allow_html=True,
-                )
+                st.error(f"PDF export failed: {e}")
+        else:
+            st.button("Export PDF 📥", disabled=True, use_container_width=True)
 
-# ── Main Q&A Area ─────────────────────────────────────────────────────────────
-if not st.session_state.doc_ready:
-    st.info("👈  Enter your Gemini API key, upload a PDF, then click **Process Document** to begin.")
-else:
-    st.success(f"Document loaded. Ask me anything from it!")
 
-    query = st.chat_input("Ask a question about your document…")
+# ── MAIN INTERFACE ─────────────────────────────────────────────────────────────
+st.markdown("<h1 class='main-header'>Study Buddy RAG 🤖</h1>", unsafe_allow_html=True)
+st.markdown(
+    "<p class='sub-header'>Your personal AI tutor. Ask questions strictly from your uploaded materials.</p>",
+    unsafe_allow_html=True,
+)
 
-    # Render history
-    for item in st.session_state.history:
-        with st.chat_message("user"):
-            st.write(item["question"])
-        with st.chat_message("assistant"):
-            if item["out_of_scope"]:
-                st.markdown(
-                    f'<div class="out-of-scope">⚠️ {item["answer"]}</div>',
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.markdown(
-                    f'<div class="answer-box">{item["answer"]}</div>',
-                    unsafe_allow_html=True,
-                )
-            if item.get("chunks") and not item["out_of_scope"]:
-                with st.expander("📎 Retrieved source chunks"):
-                    for i, chunk in enumerate(item["chunks"], 1):
+# Auto-load existing FAISS index from a previous session
+if not st.session_state.is_processed and os.path.exists("vectorstore/faiss_index"):
+    try:
+        st.session_state.vector_db = load_vector_db()
+        st.session_state.is_processed = True
+        st.sidebar.success("✅ Loaded existing knowledge base from previous session.")
+    except Exception as e:
+        st.sidebar.warning(f"Could not load existing knowledge base: {e}")
+
+# Display chat history
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        if message.get("sources"):
+            with st.expander("📄 View Retrieved Context"):
+                for idx, doc in enumerate(message["sources"]):
+                    st.markdown(
+                        f"<div class='source-chunk'><b>Chunk {idx + 1}:</b><br>{doc.page_content}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+# Chat input
+if prompt := st.chat_input("Ask a question about your documents..."):
+    # Append & show user message
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    # Generate & show assistant response
+    with st.chat_message("assistant"):
+        if not st.session_state.is_processed or st.session_state.vector_db is None:
+            st.warning("Please upload and process a document first from the sidebar.")
+            # Append a placeholder so history stays consistent
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": "⚠️ No knowledge base loaded. Please upload a PDF first.",
+                "sources": [],
+            })
+        else:
+            with st.spinner("Thinking..."):
+                try:
+                    retrieved_docs = retrieve_relevant_chunks(st.session_state.vector_db, prompt)
+                    answer = generate_answer(prompt, retrieved_docs)
+                except Exception as e:
+                    answer = f"An error occurred while generating the answer: {e}"
+                    retrieved_docs = []
+
+            # Typing animation
+            message_placeholder = st.empty()
+            full_response = ""
+            for word in answer.split():
+                full_response += word + " "
+                message_placeholder.markdown(full_response + "▌")
+                time.sleep(0.04)
+            message_placeholder.markdown(full_response.strip())
+
+            # Determine whether to show sources
+            no_answer_phrase = "The answer is not available in the uploaded documents."
+            has_sources = bool(retrieved_docs) and answer != no_answer_phrase
+
+            if has_sources:
+                with st.expander("📄 View Retrieved Context"):
+                    for idx, doc in enumerate(retrieved_docs):
                         st.markdown(
-                            f'<div class="chunk-box"><b>Chunk {i} '
-                            f'(page {chunk.get("page","?")})</b><br>{chunk["text"]}</div>',
+                            f"<div class='source-chunk'><b>Chunk {idx + 1}:</b><br>{doc.page_content}</div>",
                             unsafe_allow_html=True,
                         )
 
-    if query:
-        with st.chat_message("user"):
-            st.write(query)
-
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking…"):
-                result = st.session_state.rag.query(query, top_k=top_k)
-
-            if result["out_of_scope"]:
-                st.markdown(
-                    f'<div class="out-of-scope">⚠️ {result["answer"]}</div>',
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.markdown(
-                    f'<div class="answer-box">{result["answer"]}</div>',
-                    unsafe_allow_html=True,
-                )
-                with st.expander("📎 Retrieved source chunks"):
-                    for i, chunk in enumerate(result["chunks"], 1):
-                        st.markdown(
-                            f'<div class="chunk-box"><b>Chunk {i} '
-                            f'(page {chunk.get("page","?")})</b><br>{chunk["text"]}</div>',
-                            unsafe_allow_html=True,
-                        )
-
-        st.session_state.history.append({
-            "question":    query,
-            "answer":      result["answer"],
-            "out_of_scope": result["out_of_scope"],
-            "chunks":      result.get("chunks", []),
-        })
+            # Persist to history
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": full_response.strip(),
+                "sources": retrieved_docs if has_sources else [],
+            })
